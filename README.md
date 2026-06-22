@@ -184,7 +184,7 @@ DeepDRR can be run inside **WSL2 on Windows 11** with an NVIDIA GPU, including r
 
 | Requirement | Minimum version | Notes |
 |---|---|---|
-| Windows 11 | 22H2 or later | WSL2 GPU passthrough requires 11 or W10 21H2+ |
+| Windows 11 | 22H2 or later | WSL2 GPU passthrough requires Windows 11 22H2+ or Windows 10 21H2+ |
 | NVIDIA Windows driver | **570.x or later** | Provides the CUDA 12.8 runtime inside WSL2; see [NVIDIA CUDA on WSL2](https://docs.nvidia.com/cuda/wsl-user-guide/index.html) |
 | WSL2 kernel | 5.15+ | Ships with recent Windows Update; check with `uname -r` |
 | Ubuntu version (WSL2) | **22.04** | Tested distribution |
@@ -198,7 +198,7 @@ DeepDRR can be run inside **WSL2 on Windows 11** with an NVIDIA GPU, including r
 
 ### Step-by-step
 
-1. Install or update the NVIDIA Windows driver to **570.x+** from [nvidia.com/drivers](https://www.nvidia.com/drivers).  
+1. Install or update the NVIDIA Windows driver to **570.x+** from [nvidia.com/drivers](https://www.nvidia.com/drivers/).  
    Blackwell GPUs (GB10x / RTX Pro series) require this driver generation or later.
 2. Enable WSL2 and install Ubuntu 22.04:
    ```powershell
