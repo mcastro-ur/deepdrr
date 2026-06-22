@@ -40,8 +40,8 @@ RUN mkdir -p /usr/share/glvnd/egl_vendor.d/ && \
     }\n\
     }" > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
-# Install Miniconda
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-py310_23.5.2-0-Linux-x86_64.sh -O ~/miniconda.sh && \
+# Install Miniconda (latest installer, avoids pinning an outdated Python/Miniconda version)
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
     /bin/bash ~/miniconda.sh -b -p /opt/conda && \
     rm ~/miniconda.sh
 
@@ -53,7 +53,7 @@ RUN conda env update -n base -f environment.yml
 
 # Install deepdrr and pip dependencies
 COPY . .
-RUN pip install .[dev,cuda11x]
+RUN pip install .[dev,cuda12x]
 
 # CMD python tests/test_core.py
 CMD python -m pytest -v

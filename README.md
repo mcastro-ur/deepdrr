@@ -159,7 +159,7 @@ cd deepdrr
 sudo ./scripts/setup_ubuntu.sh # installs apt dependencies and sets up the EGL driver
 conda env create -f environment.yml # installs CUDA 12 and pytorch
 conda activate deepdrr
-pip install .[cuda11x] # this should match your CUDA version, see installation notes below
+pip install .[cuda12x] # this should match your CUDA version, see installation notes below
 ```
 
 ### Installation Notes
@@ -175,6 +175,59 @@ pip install .[cuda11x] # for CUDA 11.2 - 11.8
 pip install .[cuda12x] # for CUDA 12.x
 ```
 See [https://docs.cupy.dev/en/stable/install.html](https://docs.cupy.dev/en/stable/install.html) for more information.
+
+## Installation on WSL2 (Ubuntu 22.04) with NVIDIA Blackwell GPU
+
+DeepDRR can be run inside **WSL2 on Windows 11** with an NVIDIA GPU, including recent **Blackwell** GPUs such as the RTX Pro 1000.
+
+### Prerequisites
+
+| Requirement | Minimum version | Notes |
+|---|---|---|
+| Windows 11 | 22H2 or later | WSL2 GPU passthrough requires 11 or W10 21H2+ |
+| NVIDIA Windows driver | **570.x or later** | Provides the CUDA 12.8 runtime inside WSL2; see [NVIDIA CUDA on WSL2](https://docs.nvidia.com/cuda/wsl-user-guide/index.html) |
+| WSL2 kernel | 5.15+ | Ships with recent Windows Update; check with `uname -r` |
+| Ubuntu version (WSL2) | **22.04** | Tested distribution |
+| CUDA toolkit (in conda env) | **12.6+** | Installed automatically by `environment.yml`; for full Blackwell sm_100 JIT support use CUDA 12.8+ |
+
+### Important differences from a bare-metal install
+
+- **Do NOT install a Linux NVIDIA driver inside WSL2.** The GPU driver is provided entirely by the Windows host. Installing a Linux NVIDIA driver will break the WSL2 GPU integration.
+- The NVIDIA userspace libraries (`libEGL_nvidia.so.0`, etc.) are mounted by WSL2 at `/usr/lib/wsl/lib/`. The `scripts/setup_ubuntu.sh` script detects WSL2 automatically and writes the correct EGL vendor config pointing to that path.
+- The CUDA runtime (`libcuda.so`) is likewise provided by the Windows host driver via the WSL2 mount. You only need to install the **CUDA toolkit** (headers, compiler) from conda, which `environment.yml` handles.
+
+### Step-by-step
+
+1. Install or update the NVIDIA Windows driver to **570.x+** from [nvidia.com/drivers](https://www.nvidia.com/drivers).  
+   Blackwell GPUs (GB10x / RTX Pro series) require this driver generation or later.
+2. Enable WSL2 and install Ubuntu 22.04:
+   ```powershell
+   wsl --install -d Ubuntu-22.04
+   ```
+3. Inside the Ubuntu 22.04 WSL2 terminal, verify GPU access:
+   ```bash
+   nvidia-smi   # should list your Blackwell GPU
+   ```
+4. Install conda (we recommend [mambaforge](https://github.com/conda-forge/miniforge)):
+   ```bash
+   wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+   bash Miniforge3.sh
+   ```
+5. Clone and set up DeepDRR:
+   ```bash
+   git clone https://github.com/arcadelab/deepdrr.git
+   cd deepdrr
+   sudo ./scripts/setup_ubuntu.sh   # detects WSL2, writes correct EGL path, installs apt deps
+   conda env create -f environment.yml
+   conda activate deepdrr
+   pip install .[cuda12x]
+   ```
+
+### Blackwell GPU notes
+
+- **Compute capability**: RTX Pro 1000 and other Blackwell GPUs expose sm_100 (GB10x) or sm_120 (GB20x) compute capability. CuPy will JIT-compile kernels for these targets automatically when paired with CUDA 12.8+.
+- If the `nvidia/label/cuda-12.6.3` channel in `environment.yml` does not provide a package compatible with your exact Blackwell variant, change the channel label to `nvidia/label/cuda-12.8.0` (or later) before creating the conda environment.
+- If you encounter an **EGL not available** error, confirm that `/usr/lib/wsl/lib/libEGL_nvidia.so.0` exists and that `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` references that path (re-run `sudo ./scripts/setup_ubuntu.sh` to regenerate it).
 
 ## Installing for Development
 
