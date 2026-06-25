@@ -1,6 +1,9 @@
 name: deepdrr
 channels:
-  - "nvidia/label/cuda-12.2.0"
+  # CUDA 12.6 LTS — supports CUDA 12.x workloads including Blackwell (sm_100) via cupy-cuda12x.
+  # For full sm_100/Blackwell JIT-compilation support, CUDA 12.8+ is required; update the label
+  # below (e.g. "nvidia/label/cuda-12.8.0") if your GPU requires it.
+  - "nvidia/label/cuda-12.6.3"
   - pytorch
   - conda-forge
 dependencies:
