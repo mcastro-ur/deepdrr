@@ -1407,13 +1407,31 @@ class Projector(object):
         height = self.camera_intrinsics.sensor_height
         total_pixels = width * height
 
-        device_id = int(os.environ.get("EGL_DEVICE_ID", "0"))
-        egl_device = egl.get_device_by_index(device_id)
-        self._egl_platform = egl.EGLPlatform(
-            viewport_width=width, viewport_height=height, device=egl_device
-        )
-        self._egl_platform.init_context()
-        self._egl_platform.make_current()
+#        device_id = int(os.environ.get("EGL_DEVICE_ID", "0"))
+#        egl_device = egl.get_device_by_index(device_id)
+#        self._egl_platform = egl.EGLPlatform(
+#            viewport_width=width, viewport_height=height, device=egl_device
+#        )
+#        self._egl_platform.init_context()
+#        self._egl_platform.make_current()
+
+        # --- EGL context init (headless-safe) ---
+        self._egl_platform = None
+        self._egl_ready = False
+        
+        try:
+            device_id = int(os.environ.get("EGL_DEVICE_ID", "0"))
+            egl_device = egl.get_device_by_index(device_id)
+            self._egl_platform = egl.EGLPlatform(
+                viewport_width=width, viewport_height=height, device=egl_device
+            )
+            self._egl_platform.init_context()
+            self._egl_platform.make_current()
+            self._egl_ready = True
+        except Exception as e:
+            log.warning(f"EGL init failed, continuing without GL context: {e}")
+            self._egl_platform = None
+            self._egl_ready = False
 
         self.cupy_device = cupy.cuda.Device(self.cuda_device_id)
         self.cupy_device.__enter__()
@@ -1719,8 +1737,9 @@ class Projector(object):
     def free(self):
         """Free the allocated GPU memory."""
         if self.initialized:
-            self.gl_renderer.delete()
-
+            #self.gl_renderer.delete()
+            if getattr(self, "gl_renderer", None) is not None:
+                self.gl_renderer.delete()
             self.volumes_texobs = None
             self.volumes_texarrs = None
             self.seg_texobs = None
@@ -1762,6 +1781,11 @@ class Projector(object):
             self.cupy_device.__exit__()
 
         self.initialized = False
+        if getattr(self, "_egl_platform", None) is not None:
+          try:
+              self._egl_platform.make_uncurrent()
+          except Exception:
+              pass
 
     def __enter__(self):
         self.initialize()
