@@ -123,7 +123,12 @@ def fluoro_realistic(
 
     # 1. Normalisation percentile robuste (préserve la dynamique)
     p_lo_val, p_hi_val = np.percentile(x, [p_low, p_high])
-    x = np.clip((x - p_lo_val) / (p_hi_val - p_lo_val + 1e-8), 0.0, 1.0)
+    dyn_range = p_hi_val - p_lo_val
+    if dyn_range < 1e-6:
+        # Image quasi-uniforme : pas de normalisation utile
+        x = np.zeros_like(x)
+    else:
+        x = np.clip((x - p_lo_val) / dyn_range, 0.0, 1.0)
 
     # 2. Relevé des noirs PRE-inversion (rôle mineur, évite noirs purs)
     if black_lift > 0.0:
@@ -342,6 +347,9 @@ def main():
 
     mesh = Mesh.from_stl(
         stl_path,
+        # density=7.7 g/cm³ : valeur effective pour implant titane/acier chirurgical
+        # (titane pur ~4.5, alliage Ti-6Al-4V ~4.43, acier inox ~8.0)
+        # ajuster selon le matériau réel de l'implant
         material=DRRMaterial("titanium", density=7.7),
     )
 
