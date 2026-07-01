@@ -32,6 +32,10 @@ BETA_DEG  = 0.0      # CRA(+) / CAU(-) degrés
 # ---- Taille de sortie ----
 OUTPUT_SIZE = (640, 640)  # (largeur, hauteur) en pixels
 
+# ---- Bounding box : couleur et épaisseur ----
+BBOX_COLOR     = (0, 255, 0)   # vert vif (BGR)
+BBOX_THICKNESS = 1             # épaisseur des arêtes en pixels
+
 
 def _get_matrix(transform):
     if hasattr(transform, "matrix"):
@@ -53,17 +57,124 @@ def build_registered_mesh_stl(ct):
     tm.export(FINAL_STL)
     mesh_centroid = tm.vertices.mean(axis=0)
     print(f"Mesh centroid (world): {mesh_centroid}")
-    return FINAL_STL, mesh_centroid
+    # Calcul de la bounding box 3D (8 coins) dans le repère world
+    vmin = tm.vertices.min(axis=0)
+    vmax = tm.vertices.max(axis=0)
+    bbox_corners_world = np.array([
+        [vmin[0], vmin[1], vmin[2]],
+        [vmax[0], vmin[1], vmin[2]],
+        [vmax[0], vmax[1], vmin[2]],
+        [vmin[0], vmax[1], vmin[2]],
+        [vmin[0], vmin[1], vmax[2]],
+        [vmax[0], vmin[1], vmax[2]],
+        [vmax[0], vmax[1], vmax[2]],
+        [vmin[0], vmax[1], vmax[2]],
+    ])
+    print(f"Bounding box (world) — min: {vmin}  max: {vmax}")
+    return FINAL_STL, mesh_centroid, bbox_corners_world
+
+
+# ============================================================
+#  PROJECTION 3D → 2D (world → pixels détecteur)
+# ============================================================
+
+def project_points_world_to_pixel(points_world, device, img_shape):
+    """
+    Projette des points 3D (repère world, mm) vers des coordonnées pixel
+    dans l'image DRR de taille img_shape (H, W).
+
+    La projection suit la géométrie pinhole du C-arm :
+      - source S dans world
+      - centre détecteur D dans world
+      - base orthonormée du détecteur (u, v)
+      - taille physique du détecteur et résolution connues via device
+    """
+    # ---- Paramètres géométriques du device ----
+    src_w  = np.array(device.world_from_device @ device.source_in_device, dtype=np.float64)
+    # Centre du détecteur dans world
+    det_center_w = np.array(
+        device.world_from_device @ device.detector_center_in_device, dtype=np.float64
+    )
+    # Axes du détecteur dans world (colonnes de world_from_device, indices 0=u, 1=v)
+    R = np.array(device.world_from_device.matrix[:3, :3], dtype=np.float64)
+    u_axis = R[:, 0]   # axe horizontal détecteur (colonnes croissantes)
+    v_axis = R[:, 1]   # axe vertical   détecteur (lignes croissantes)
+
+    # Taille physique du détecteur (mm) et résolution (pixels)
+    det_w_mm  = float(device.detector_width)
+    det_h_mm  = float(device.detector_height)
+    H, W = img_shape
+
+    pixel_pts = []
+    for P in points_world:
+        P = np.asarray(P, dtype=np.float64)
+        d = P - src_w                  # vecteur source → point
+        n = det_center_w - src_w       # vecteur source → centre détecteur
+
+        # Paramètre t tel que le rayon atteigne le plan détecteur
+        # Plan détecteur : normale = direction optique = n/|n|
+        normal = n / np.linalg.norm(n)
+        denom  = np.dot(d, normal)
+        if abs(denom) < 1e-9:
+            pixel_pts.append(None)
+            continue
+        t = np.dot(n, normal) / denom
+        Q = src_w + t * d              # point projeté sur le plan détecteur
+
+        # Coordonnées locales sur le détecteur (en mm, origine = centre)
+        delta = Q - det_center_w
+        u_mm  =  np.dot(delta, u_axis)
+        v_mm  =  np.dot(delta, v_axis)
+
+        # Conversion mm → pixel (origine = coin supérieur gauche)
+        col = int(round((u_mm / det_w_mm + 0.5) * W))
+        row = int(round((v_mm / det_h_mm + 0.5) * H))
+        pixel_pts.append((col, row))
+
+    return pixel_pts
+
+
+# Arêtes du cube (indices des 8 coins)
+BBOX_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),   # face basse
+    (4, 5), (5, 6), (6, 7), (7, 4),   # face haute
+    (0, 4), (1, 5), (2, 6), (3, 7),   # colonnes verticales
+]
+
+
+def draw_bbox_on_image(img_u8, bbox_corners_world, device,
+                       color=BBOX_COLOR, thickness=BBOX_THICKNESS):
+    """
+    Convertit img_u8 (uint8 grayscale) en BGR, projette les 8 coins 3D
+    de la bounding box, trace les 12 arêtes et retourne l'image BGR uint8.
+    """
+    H, W = img_u8.shape
+    bgr = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
+
+    pts2d = project_points_world_to_pixel(bbox_corners_world, device, (H, W))
+
+    for i, j in BBOX_EDGES:
+        pi, pj = pts2d[i], pts2d[j]
+        if pi is None or pj is None:
+            continue
+        # Dessine même si partiellement hors cadre (cv2 clip automatiquement)
+        cv2.line(bgr, pi, pj, color, thickness, lineType=cv2.LINE_AA)
+
+    return bgr
 
 
 def resize_to_output(img):
-    """Redimensionne une image (uint8 2D) à OUTPUT_SIZE avec interpolation bicubique."""
+    """Redimensionne une image (uint8 2D ou 3D) à OUTPUT_SIZE avec interpolation bicubique."""
     return cv2.resize(img, OUTPUT_SIZE, interpolation=cv2.INTER_CUBIC)
 
 
 def imwrite_resized(path, img):
-    """Redimensionne l'image à OUTPUT_SIZE puis l'enregistre."""
-    iio.imwrite(path, resize_to_output(img))
+    """Redimensionne l'image à OUTPUT_SIZE puis l'enregistre (gère grayscale et BGR→RGB)."""
+    out = resize_to_output(img)
+    if out.ndim == 3:
+        # cv2 travaille en BGR ; imageio attend RGB
+        out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+    iio.imwrite(path, out)
 
 
 # ============================================================
@@ -82,10 +193,8 @@ def reinhard_tonemap(x, white_point=1.0, black_lift=0.0):
         image tone-mappée, float [0, 1]
     """
     x = np.clip(x, 0.0, 1.0)
-    # Reinhard étendu : x * (1 + x / white_point^2) / (1 + x)
     wp2 = white_point * white_point
     x_tm = x * (1.0 + x / wp2) / (1.0 + x)
-    # Relevé des noirs
     if black_lift > 0.0:
         x_tm = x_tm * (1.0 - black_lift) + black_lift
     return np.clip(x_tm, 0.0, 1.0)
@@ -104,70 +213,68 @@ def reinhard_tonemap(x, white_point=1.0, black_lift=0.0):
 def fluoro_realistic(
     img,
     # --- Normalisation percentile ---
-    p_low          = 0.5,    # percentile bas  (0.5 = préserve la dynamique complète)
-    p_high         = 99.5,   # percentile haut (99.5 = préserve la dynamique complète)
+    p_low          = 0.5,
+    p_high         = 99.5,
     # --- Relevé des noirs PRE-inversion (rôle mineur) ---
-    black_lift     = 0.02,   # relève légèrement les noirs avant inversion
+    black_lift     = 0.02,
     # --- Exposition ---
-    photons        = 8000.0,  # haute dose => quasi pas de grain
+    photons        = 8000.0,
     # --- Gamma (chaîne DICOM typique) ---
-    gamma          = 0.50,    # 0.45-0.55 = courbe typique flat-panel
+    gamma          = 0.50,
     # --- Scatter (diffusion Compton basse fréquence) ---
-    scatter_sigma  = 30.0,    # large = basse fréquence réaliste
-    scatter_weight = 0.08,    # 8% scatter/primaire : typique thorax/bassin
+    scatter_sigma  = 30.0,
+    scatter_weight = 0.08,
     # --- Flou détecteur (MTF flat-panel ~0.3-0.6 mm FWHM) ---
-    blur_sigma     = 0.6,     # en pixels, très léger
+    blur_sigma     = 0.6,
     # --- Bruit électronique (readout noise) ---
-    elec_sigma     = 0.003,   # très faible sur flat-panel moderne
+    elec_sigma     = 0.003,
     # --- Vignettage ---
-    vignette       = 0.10,    # subtil, 10% perte aux coins
+    vignette       = 0.10,
     # --- CLAHE très doux ---
-    clahe_clip     = 1.5,     # faible = pas d'artefacts de contraste local
-    clahe_grid     = (16, 16), # grande grille = transition douce
+    clahe_clip     = 1.5,
+    clahe_grid     = (16, 16),
     # --- Inversion ---
     invert         = True,
     # --- Relevé des noirs POST-inversion ---
-    post_black_lift     = 0.15,   # relève les noirs APRES inversion (0.10-0.20)
-    post_white_compress = 0.92,   # compresse légèrement les blancs post-inversion
+    post_black_lift     = 0.15,
+    post_white_compress = 0.92,
     seed           = 42,
 ):
     rng = np.random.default_rng(seed)
     x = img.astype(np.float64)
 
-    # 1. Normalisation percentile robuste (préserve la dynamique)
+    # 1. Normalisation percentile robuste
     p_lo_val, p_hi_val = np.percentile(x, [p_low, p_high])
     dyn_range = p_hi_val - p_lo_val
     if dyn_range < 1e-6:
-        # Image quasi-uniforme : pas de normalisation utile
         x = np.zeros_like(x)
     else:
         x = np.clip((x - p_lo_val) / dyn_range, 0.0, 1.0)
 
-    # 2. Relevé des noirs PRE-inversion (rôle mineur, évite noirs purs)
+    # 2. Relevé des noirs PRE-inversion
     if black_lift > 0.0:
         x = x * (1.0 - black_lift) + black_lift
 
-    # 3. Gamma (courbe de réponse détecteur)
+    # 3. Gamma
     x = np.power(np.clip(x, 1e-8, 1.0), gamma)
 
     # 4. Scatter basse fréquence (Compton diffus)
-    #    Utiliser scipy pour éviter artefacts bord OpenCV
     scatter = gaussian_filter(x.astype(np.float32), sigma=scatter_sigma)
     x = (1.0 - scatter_weight) * x + scatter_weight * scatter.astype(np.float64)
 
     # 5. Flou détecteur (MTF flat-panel)
     x = cv2.GaussianBlur(x.astype(np.float32), (0, 0), blur_sigma).astype(np.float64)
 
-    # 6. Bruit quantique Poisson (dose haute => grain très faible)
+    # 6. Bruit quantique Poisson
     lam = np.clip(x * photons, 0, None)
     x = rng.poisson(lam).astype(np.float64) / photons
 
-    # 7. Bruit électronique (readout, très faible sur flat-panel)
+    # 7. Bruit électronique
     x += rng.normal(0.0, elec_sigma, x.shape)
 
     x = np.clip(x, 0.0, 1.0)
 
-    # 8. Vignettage subtil (chute illumination aux bords)
+    # 8. Vignettage
     h, w = x.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     xn = (xx - w / 2.0) / (w / 2.0)
@@ -178,18 +285,16 @@ def fluoro_realistic(
 
     x = np.clip(x, 0.0, 1.0)
 
-    # 9. Inversion (os = blanc, fond = noir → style fluoro)
+    # 9. Inversion
     if invert:
         x = 1.0 - x
 
-    # ---- Post-inversion : relevé des noirs + compression des blancs ----
-    # Relève les noirs (zones sombres après inversion = fond/tissu mou)
+    # Post-inversion : relevé des noirs + compression des blancs
     x = x * (1.0 - post_black_lift) + post_black_lift
-    # Compression douce des blancs (évite saturation os/métal)
     x = reinhard_tonemap(x, white_point=post_white_compress, black_lift=0.0)
     x = np.clip(x, 0.0, 1.0)
 
-    # 10. CLAHE très doux (rehaussement local minimal)
+    # 10. CLAHE très doux
     u8 = (x * 255).astype(np.uint8)
     clahe_obj = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_grid)
     u8 = clahe_obj.apply(u8)
@@ -201,20 +306,12 @@ def fluoro_realistic(
 def fluoro_high_dose(img, seed=42):
     return fluoro_realistic(
         img,
-        p_low=0.5,
-        p_high=99.5,
-        black_lift=0.02,
-        photons=12000.0,
-        gamma=0.48,
-        scatter_sigma=35.0,
-        scatter_weight=0.07,
-        blur_sigma=0.5,
-        elec_sigma=0.002,
-        vignette=0.08,
-        clahe_clip=1.3,
-        clahe_grid=(16, 16),
-        post_black_lift=0.18,
-        post_white_compress=0.90,
+        p_low=0.5, p_high=99.5, black_lift=0.02,
+        photons=12000.0, gamma=0.48,
+        scatter_sigma=35.0, scatter_weight=0.07,
+        blur_sigma=0.5, elec_sigma=0.002, vignette=0.08,
+        clahe_clip=1.3, clahe_grid=(16, 16),
+        post_black_lift=0.18, post_white_compress=0.90,
         seed=seed,
     )
 
@@ -223,20 +320,12 @@ def fluoro_high_dose(img, seed=42):
 def fluoro_standard(img, seed=42):
     return fluoro_realistic(
         img,
-        p_low=0.5,
-        p_high=99.5,
-        black_lift=0.02,
-        photons=5000.0,
-        gamma=0.52,
-        scatter_sigma=28.0,
-        scatter_weight=0.09,
-        blur_sigma=0.7,
-        elec_sigma=0.004,
-        vignette=0.12,
-        clahe_clip=1.6,
-        clahe_grid=(16, 16),
-        post_black_lift=0.15,
-        post_white_compress=0.92,
+        p_low=0.5, p_high=99.5, black_lift=0.02,
+        photons=5000.0, gamma=0.52,
+        scatter_sigma=28.0, scatter_weight=0.09,
+        blur_sigma=0.7, elec_sigma=0.004, vignette=0.12,
+        clahe_clip=1.6, clahe_grid=(16, 16),
+        post_black_lift=0.15, post_white_compress=0.92,
         seed=seed,
     )
 
@@ -245,20 +334,12 @@ def fluoro_standard(img, seed=42):
 def fluoro_low_dose(img, seed=42):
     return fluoro_realistic(
         img,
-        p_low=0.5,
-        p_high=99.5,
-        black_lift=0.02,
-        photons=1500.0,
-        gamma=0.55,
-        scatter_sigma=22.0,
-        scatter_weight=0.11,
-        blur_sigma=0.9,
-        elec_sigma=0.008,
-        vignette=0.15,
-        clahe_clip=1.8,
-        clahe_grid=(12, 12),
-        post_black_lift=0.12,
-        post_white_compress=0.93,
+        p_low=0.5, p_high=99.5, black_lift=0.02,
+        photons=1500.0, gamma=0.55,
+        scatter_sigma=22.0, scatter_weight=0.11,
+        blur_sigma=0.9, elec_sigma=0.008, vignette=0.15,
+        clahe_clip=1.8, clahe_grid=(12, 12),
+        post_black_lift=0.12, post_white_compress=0.93,
         seed=seed,
     )
 
@@ -276,7 +357,7 @@ def to_uint8_shared(a, b):
     return _cvt(a), _cvt(b)
 
 
-def render_pair(ct, mesh, device, tag):
+def render_pair(ct, mesh, device, tag, bbox_corners_world):
     with Projector([ct], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p0:
         img0 = p0()
     with Projector([ct, mesh], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p1:
@@ -285,37 +366,45 @@ def render_pair(ct, mesh, device, tag):
     diff = np.abs(img1.astype(np.float32) - img0.astype(np.float32))
     print(f"[{tag}] diff max={float(diff.max()):.6f} mean={float(diff.mean()):.6f}")
 
-    # DRR bruts (normalisation partagée)
-    ct_u8, mix_u8 = to_uint8_shared(img0, img1)
-    imwrite_resized(f"drr_ct_{tag}.png",   ct_u8)
-    imwrite_resized(f"drr_mesh_{tag}.png", mix_u8)
-    imwrite_resized(f"drr_diff_{tag}.png", to_uint8(diff))
+    def _with_bbox(u8):
+        """Ajoute la bounding box 3D projetée sur une image grayscale uint8."""
+        return draw_bbox_on_image(u8, bbox_corners_world, device)
 
-    # --- Haute dose ---
+    # ---- DRR bruts ----
+    ct_u8, mix_u8 = to_uint8_shared(img0, img1)
+    imwrite_resized(f"drr_ct_{tag}.png",   _with_bbox(ct_u8))
+    imwrite_resized(f"drr_mesh_{tag}.png", _with_bbox(mix_u8))
+    imwrite_resized(f"drr_diff_{tag}.png", _with_bbox(to_uint8(diff)))
+
+    # ---- Haute dose ----
     f_hd_ct   = fluoro_high_dose(img0)
     f_hd_mesh = fluoro_high_dose(img1)
-    imwrite_resized(f"fluoro_hd_ct_{tag}.png",   f_hd_ct)
-    imwrite_resized(f"fluoro_hd_mesh_{tag}.png",  f_hd_mesh)
+    imwrite_resized(f"fluoro_hd_ct_{tag}.png",   _with_bbox(f_hd_ct))
+    imwrite_resized(f"fluoro_hd_mesh_{tag}.png",  _with_bbox(f_hd_mesh))
     imwrite_resized(f"fluoro_hd_diff_{tag}.png",
-                to_uint8(np.abs(f_hd_mesh.astype(np.float32) - f_hd_ct.astype(np.float32))))
+                    _with_bbox(to_uint8(np.abs(
+                        f_hd_mesh.astype(np.float32) - f_hd_ct.astype(np.float32)))))
 
-    # --- Dose standard ---
+    # ---- Dose standard ----
     f_st_ct   = fluoro_standard(img0)
     f_st_mesh = fluoro_standard(img1)
-    imwrite_resized(f"fluoro_std_ct_{tag}.png",   f_st_ct)
-    imwrite_resized(f"fluoro_std_mesh_{tag}.png",  f_st_mesh)
+    imwrite_resized(f"fluoro_std_ct_{tag}.png",   _with_bbox(f_st_ct))
+    imwrite_resized(f"fluoro_std_mesh_{tag}.png",  _with_bbox(f_st_mesh))
     imwrite_resized(f"fluoro_std_diff_{tag}.png",
-                to_uint8(np.abs(f_st_mesh.astype(np.float32) - f_st_ct.astype(np.float32))))
+                    _with_bbox(to_uint8(np.abs(
+                        f_st_mesh.astype(np.float32) - f_st_ct.astype(np.float32)))))
 
-    # --- Faible dose ---
+    # ---- Faible dose ----
     f_ld_ct   = fluoro_low_dose(img0)
     f_ld_mesh = fluoro_low_dose(img1)
-    imwrite_resized(f"fluoro_ld_ct_{tag}.png",   f_ld_ct)
-    imwrite_resized(f"fluoro_ld_mesh_{tag}.png",  f_ld_mesh)
+    imwrite_resized(f"fluoro_ld_ct_{tag}.png",   _with_bbox(f_ld_ct))
+    imwrite_resized(f"fluoro_ld_mesh_{tag}.png",  _with_bbox(f_ld_mesh))
     imwrite_resized(f"fluoro_ld_diff_{tag}.png",
-                to_uint8(np.abs(f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32))))
+                    _with_bbox(to_uint8(np.abs(
+                        f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32)))))
 
-    print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld  ({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px)")
+    print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld  "
+          f"({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px, bbox projetée en vert)")
 
 
 def make_device(mesh_centroid_world, alpha_deg, beta_deg, sdd, sid):
@@ -356,7 +445,7 @@ def main():
     ct = deepdrr.Volume.from_nifti(CT_PATH)
     print("CT center (world):", np.array(ct.center_in_world))
 
-    stl_path, mesh_centroid = build_registered_mesh_stl(ct)
+    stl_path, mesh_centroid, bbox_corners_world = build_registered_mesh_stl(ct)
 
     mesh = Mesh.from_stl(
         stl_path,
@@ -374,7 +463,7 @@ def main():
         sid=SID,
     )
 
-    render_pair(ct, mesh, device, "final")
+    render_pair(ct, mesh, device, "final", bbox_corners_world)
 
     print("\nDone. Outputs par preset :")
     print("  drr_ct / drr_mesh / drr_diff")
@@ -382,6 +471,7 @@ def main():
     print("  fluoro_std_ct / fluoro_std_mesh / fluoro_std_diff ← dose standard")
     print("  fluoro_ld_ct / fluoro_ld_mesh / fluoro_ld_diff   ← faible dose, plus granulaire")
     print(f"  Toutes les images : {OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} pixels")
+    print("  Bounding box 3D du PLY projetée en vert sur toutes les images")
 
 
 if __name__ == "__main__":
