@@ -75,38 +75,61 @@ def build_registered_mesh_stl(ct):
 
 
 # ============================================================
-#  PROJECTION 3D → 2D via la matrice de projection du C-arm
-#  On utilise device.get_camera_projection() qui retourne un
-#  geo.CameraProjection (index_from_world) — c'est l'API propre
-#  de DeepDRR pour projeter des points world → pixels.
+#  PROJECTION 3D → 2D  (world mm → pixels détecteur)
+#
+#  On construit manuellement la matrice P = K @ E[:3, :] à partir
+#  des attributs réellement disponibles sur MobileCArm :
+#    - device.camera_intrinsics  → CameraIntrinsicTransform (fx, fy, cx, cy)
+#    - device.camera3d_from_world → FrameTransform  (extrinsèque 4×4)
+#  Aucun appel à des attributs inexistants (matrix, detector_center…).
 # ============================================================
+
+def _intrinsic_matrix(device) -> np.ndarray:
+    """Retourne la matrice intrinsèque K (3×3) du détecteur."""
+    intr = device.camera_intrinsics   # geo.CameraIntrinsicTransform
+    fx = float(intr.fx)
+    fy = float(intr.fy)
+    cx = float(intr.cx)
+    cy = float(intr.cy)
+    return np.array([
+        [fx,  0., cx],
+        [0.,  fy, cy],
+        [0.,  0., 1.],
+    ], dtype=np.float64)
+
+
+def _extrinsic_matrix(device) -> np.ndarray:
+    """Retourne la matrice extrinsèque E (3×4) camera3d_from_world."""
+    E4 = np.array(device.camera3d_from_world, dtype=np.float64)  # (4,4) ou (3,4)
+    return E4[:3, :]   # on garde les 3 premières lignes → (3, 4)
+
 
 def project_points_world_to_pixel(points_world, device):
     """
-    Projette des points 3D (repère world, mm) → coordonnées pixel (col, row)
-    en utilisant la matrice de projection pinhole du C-arm.
+    Projette des points 3D (repère world, mm) → (col, row) pixels.
+
+    Utilise la projection pinhole standard :
+        P = K @ E          (3×4)
+        [u, v, w]^T = P @ [X, Y, Z, 1]^T
+        col = u/w,  row = v/w
 
     Returns:
-        list of (col, row) int tuples, or None if point is behind the camera.
+        list of (col, row) int tuples, or None si le point est derrière la caméra.
     """
-    proj = device.get_camera_projection()   # geo.CameraProjection : index_from_world
-    # La matrice 3×4 complète (intrinsics @ extrinsics)
-    P = np.array(proj.matrix, dtype=np.float64)   # shape (3, 4)
+    K = _intrinsic_matrix(device)   # (3, 3)
+    E = _extrinsic_matrix(device)   # (3, 4)
+    P = K @ E                       # (3, 4)
 
     pixel_pts = []
     for pt in points_world:
-        pt = np.asarray(pt, dtype=np.float64)
-        # Coordonnées homogènes world
-        ph = np.append(pt, 1.0)               # (4,)
-        uvw = P @ ph                           # (3,)
-        w = uvw[2]
-        if abs(w) < 1e-9 or w < 0:            # derrière la caméra
+        ph  = np.append(np.asarray(pt, dtype=np.float64), 1.0)  # (4,)
+        uvw = P @ ph                                              # (3,)
+        w   = uvw[2]
+        if abs(w) < 1e-9 or w < 0:   # derrière la caméra
             pixel_pts.append(None)
             continue
-        col = int(round(uvw[0] / w))
-        row = int(round(uvw[1] / w))
-        pixel_pts.append((col, row))
-
+        pixel_pts.append((int(round(uvw[0] / w)),
+                          int(round(uvw[1] / w))))
     return pixel_pts
 
 
@@ -125,7 +148,6 @@ def draw_bbox_on_image(img_u8, bbox_corners_world, device,
     de la bounding box et trace les 12 arêtes. Retourne une image BGR uint8.
     """
     bgr = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
-
     pts2d = project_points_world_to_pixel(bbox_corners_world, device)
 
     for i, j in BBOX_EDGES:
