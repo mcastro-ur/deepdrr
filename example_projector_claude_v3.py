@@ -75,60 +75,36 @@ def build_registered_mesh_stl(ct):
 
 
 # ============================================================
-#  PROJECTION 3D → 2D (world → pixels détecteur)
+#  PROJECTION 3D → 2D via la matrice de projection du C-arm
+#  On utilise device.get_camera_projection() qui retourne un
+#  geo.CameraProjection (index_from_world) — c'est l'API propre
+#  de DeepDRR pour projeter des points world → pixels.
 # ============================================================
 
-def project_points_world_to_pixel(points_world, device, img_shape):
+def project_points_world_to_pixel(points_world, device):
     """
-    Projette des points 3D (repère world, mm) vers des coordonnées pixel
-    dans l'image DRR de taille img_shape (H, W).
+    Projette des points 3D (repère world, mm) → coordonnées pixel (col, row)
+    en utilisant la matrice de projection pinhole du C-arm.
 
-    La projection suit la géométrie pinhole du C-arm :
-      - source S dans world
-      - centre détecteur D dans world
-      - base orthonormée du détecteur (u, v)
-      - taille physique du détecteur et résolution connues via device
+    Returns:
+        list of (col, row) int tuples, or None if point is behind the camera.
     """
-    # ---- Paramètres géométriques du device ----
-    src_w  = np.array(device.world_from_device @ device.source_in_device, dtype=np.float64)
-    # Centre du détecteur dans world
-    det_center_w = np.array(
-        device.world_from_device @ device.detector_center_in_device, dtype=np.float64
-    )
-    # Axes du détecteur dans world (colonnes de world_from_device, indices 0=u, 1=v)
-    R = np.array(device.world_from_device.matrix[:3, :3], dtype=np.float64)
-    u_axis = R[:, 0]   # axe horizontal détecteur (colonnes croissantes)
-    v_axis = R[:, 1]   # axe vertical   détecteur (lignes croissantes)
-
-    # Taille physique du détecteur (mm) et résolution (pixels)
-    det_w_mm  = float(device.detector_width)
-    det_h_mm  = float(device.detector_height)
-    H, W = img_shape
+    proj = device.get_camera_projection()   # geo.CameraProjection : index_from_world
+    # La matrice 3×4 complète (intrinsics @ extrinsics)
+    P = np.array(proj.matrix, dtype=np.float64)   # shape (3, 4)
 
     pixel_pts = []
-    for P in points_world:
-        P = np.asarray(P, dtype=np.float64)
-        d = P - src_w                  # vecteur source → point
-        n = det_center_w - src_w       # vecteur source → centre détecteur
-
-        # Paramètre t tel que le rayon atteigne le plan détecteur
-        # Plan détecteur : normale = direction optique = n/|n|
-        normal = n / np.linalg.norm(n)
-        denom  = np.dot(d, normal)
-        if abs(denom) < 1e-9:
+    for pt in points_world:
+        pt = np.asarray(pt, dtype=np.float64)
+        # Coordonnées homogènes world
+        ph = np.append(pt, 1.0)               # (4,)
+        uvw = P @ ph                           # (3,)
+        w = uvw[2]
+        if abs(w) < 1e-9 or w < 0:            # derrière la caméra
             pixel_pts.append(None)
             continue
-        t = np.dot(n, normal) / denom
-        Q = src_w + t * d              # point projeté sur le plan détecteur
-
-        # Coordonnées locales sur le détecteur (en mm, origine = centre)
-        delta = Q - det_center_w
-        u_mm  =  np.dot(delta, u_axis)
-        v_mm  =  np.dot(delta, v_axis)
-
-        # Conversion mm → pixel (origine = coin supérieur gauche)
-        col = int(round((u_mm / det_w_mm + 0.5) * W))
-        row = int(round((v_mm / det_h_mm + 0.5) * H))
+        col = int(round(uvw[0] / w))
+        row = int(round(uvw[1] / w))
         pixel_pts.append((col, row))
 
     return pixel_pts
@@ -146,18 +122,16 @@ def draw_bbox_on_image(img_u8, bbox_corners_world, device,
                        color=BBOX_COLOR, thickness=BBOX_THICKNESS):
     """
     Convertit img_u8 (uint8 grayscale) en BGR, projette les 8 coins 3D
-    de la bounding box, trace les 12 arêtes et retourne l'image BGR uint8.
+    de la bounding box et trace les 12 arêtes. Retourne une image BGR uint8.
     """
-    H, W = img_u8.shape
     bgr = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
 
-    pts2d = project_points_world_to_pixel(bbox_corners_world, device, (H, W))
+    pts2d = project_points_world_to_pixel(bbox_corners_world, device)
 
     for i, j in BBOX_EDGES:
         pi, pj = pts2d[i], pts2d[j]
         if pi is None or pj is None:
             continue
-        # Dessine même si partiellement hors cadre (cv2 clip automatiquement)
         cv2.line(bgr, pi, pj, color, thickness, lineType=cv2.LINE_AA)
 
     return bgr
