@@ -29,6 +29,9 @@ ALPHA_DEG = 0.0      # LAO(+) / RAO(-) degrés
 BETA_DEG  = 0.0      # CRA(+) / CAU(-) degrés
 # ============================================================
 
+# ---- Taille de sortie ----
+OUTPUT_SIZE = (640, 640)  # (largeur, hauteur) en pixels
+
 
 def _get_matrix(transform):
     if hasattr(transform, "matrix"):
@@ -51,6 +54,16 @@ def build_registered_mesh_stl(ct):
     mesh_centroid = tm.vertices.mean(axis=0)
     print(f"Mesh centroid (world): {mesh_centroid}")
     return FINAL_STL, mesh_centroid
+
+
+def resize_to_output(img):
+    """Redimensionne une image (uint8 2D) à OUTPUT_SIZE avec interpolation bicubique."""
+    return cv2.resize(img, OUTPUT_SIZE, interpolation=cv2.INTER_CUBIC)
+
+
+def imwrite_resized(path, img):
+    """Redimensionne l'image à OUTPUT_SIZE puis l'enregistre."""
+    iio.imwrite(path, resize_to_output(img))
 
 
 # ============================================================
@@ -274,35 +287,35 @@ def render_pair(ct, mesh, device, tag):
 
     # DRR bruts (normalisation partagée)
     ct_u8, mix_u8 = to_uint8_shared(img0, img1)
-    iio.imwrite(f"drr_ct_{tag}.png",   ct_u8)
-    iio.imwrite(f"drr_mesh_{tag}.png", mix_u8)
-    iio.imwrite(f"drr_diff_{tag}.png", to_uint8(diff))
+    imwrite_resized(f"drr_ct_{tag}.png",   ct_u8)
+    imwrite_resized(f"drr_mesh_{tag}.png", mix_u8)
+    imwrite_resized(f"drr_diff_{tag}.png", to_uint8(diff))
 
     # --- Haute dose ---
     f_hd_ct   = fluoro_high_dose(img0)
     f_hd_mesh = fluoro_high_dose(img1)
-    iio.imwrite(f"fluoro_hd_ct_{tag}.png",   f_hd_ct)
-    iio.imwrite(f"fluoro_hd_mesh_{tag}.png",  f_hd_mesh)
-    iio.imwrite(f"fluoro_hd_diff_{tag}.png",
+    imwrite_resized(f"fluoro_hd_ct_{tag}.png",   f_hd_ct)
+    imwrite_resized(f"fluoro_hd_mesh_{tag}.png",  f_hd_mesh)
+    imwrite_resized(f"fluoro_hd_diff_{tag}.png",
                 to_uint8(np.abs(f_hd_mesh.astype(np.float32) - f_hd_ct.astype(np.float32))))
 
     # --- Dose standard ---
     f_st_ct   = fluoro_standard(img0)
     f_st_mesh = fluoro_standard(img1)
-    iio.imwrite(f"fluoro_std_ct_{tag}.png",   f_st_ct)
-    iio.imwrite(f"fluoro_std_mesh_{tag}.png",  f_st_mesh)
-    iio.imwrite(f"fluoro_std_diff_{tag}.png",
+    imwrite_resized(f"fluoro_std_ct_{tag}.png",   f_st_ct)
+    imwrite_resized(f"fluoro_std_mesh_{tag}.png",  f_st_mesh)
+    imwrite_resized(f"fluoro_std_diff_{tag}.png",
                 to_uint8(np.abs(f_st_mesh.astype(np.float32) - f_st_ct.astype(np.float32))))
 
     # --- Faible dose ---
     f_ld_ct   = fluoro_low_dose(img0)
     f_ld_mesh = fluoro_low_dose(img1)
-    iio.imwrite(f"fluoro_ld_ct_{tag}.png",   f_ld_ct)
-    iio.imwrite(f"fluoro_ld_mesh_{tag}.png",  f_ld_mesh)
-    iio.imwrite(f"fluoro_ld_diff_{tag}.png",
+    imwrite_resized(f"fluoro_ld_ct_{tag}.png",   f_ld_ct)
+    imwrite_resized(f"fluoro_ld_mesh_{tag}.png",  f_ld_mesh)
+    imwrite_resized(f"fluoro_ld_diff_{tag}.png",
                 to_uint8(np.abs(f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32))))
 
-    print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld")
+    print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld  ({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px)")
 
 
 def make_device(mesh_centroid_world, alpha_deg, beta_deg, sdd, sid):
@@ -368,6 +381,7 @@ def main():
     print("  fluoro_hd_ct / fluoro_hd_mesh / fluoro_hd_diff   ← haute dose, plus net")
     print("  fluoro_std_ct / fluoro_std_mesh / fluoro_std_diff ← dose standard")
     print("  fluoro_ld_ct / fluoro_ld_mesh / fluoro_ld_diff   ← faible dose, plus granulaire")
+    print(f"  Toutes les images : {OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} pixels")
 
 
 if __name__ == "__main__":
