@@ -28,6 +28,8 @@ SDD       = 1020.0   # Source-to-Detector Distance (mm)
 SID       = 530.0    # Source-to-Isocenter Distance (mm)
 ALPHA_DEG = 0.0      # LAO(+) / RAO(-) degrés
 BETA_DEG  = 0.0      # CRA(+) / CAU(-) degrés
+SPECTRUM  = "60KV_AL35"  # Spectre basse énergie = métal très absorbant (noir prononcé)
+IUB       = 4.0          # intensity_upper_bound réduit = métal prend plus de place dans l'échelle
 # ============================================================
 
 # ---- Taille de sortie ----
@@ -125,33 +127,60 @@ def project_bbox_on_image(pts_world, lines, device, img_shape):
     return pts_2d, lines
 
 
-def draw_bbox_on_image(img_u8, pts_2d, lines, color=(0, 0, 255), thickness=1):
+def draw_bbox_on_image(img_u8, pts_2d, lines, color=(0, 255, 0), thickness=2):
     """
     Dessine la bounding box (segments) sur une image uint8 en niveaux de gris.
+    L'image d'entrée est supposée déjà à OUTPUT_SIZE (640x640).
 
     Args:
-        img_u8: np.ndarray (H, W) uint8
-        pts_2d: np.ndarray (N, 2) coordonnées pixel (col, row)
+        img_u8: np.ndarray (H, W) uint8 — déjà redimensionnée à OUTPUT_SIZE
+        pts_2d: np.ndarray (N, 2) coordonnées pixel (col, row) dans l'espace natif capteur
         lines: list of (i, j) paires d'indices
         color: couleur BGR des segments
         thickness: épaisseur des segments en pixels
 
     Returns:
-        img_rgb: np.ndarray (H, W, 3) uint8 avec bbox dessinée en rouge sur fond gris
+        img_rgb: np.ndarray (OUTPUT_SIZE[1], OUTPUT_SIZE[0], 3) uint8 avec bbox dessinée
     """
+    # img_u8 est déjà à OUTPUT_SIZE après imwrite_resized — on travaille directement dessus
     img_rgb = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
-    draw_color = color
 
-    h, w = img_u8.shape
+    h_out, w_out = img_u8.shape  # = OUTPUT_SIZE[1], OUTPUT_SIZE[0]
+
+    # Les pts_2d sont dans l'espace capteur natif (ex: 1536x1536).
+    # On les met à l'échelle vers OUTPUT_SIZE.
+    # On estime la taille native depuis les coordonnées elles-mêmes (max observé).
+    # Si les pts sont tous dans [0, OUTPUT_SIZE] c'est déjà OK, sinon on scale.
+    if len(pts_2d) > 0:
+        native_max_x = pts_2d[:, 0].max()
+        native_max_y = pts_2d[:, 1].max()
+        native_min_x = pts_2d[:, 0].min()
+        native_min_y = pts_2d[:, 1].min()
+
+        # Heuristique : si les coordonnées dépassent largement OUTPUT_SIZE,
+        # on suppose qu'elles sont dans l'espace capteur natif et on scale.
+        # Sinon on les utilise telles quelles.
+        native_w = max(native_max_x, w_out)
+        native_h = max(native_max_y, h_out)
+        scale_x = w_out / native_w if native_w > w_out else 1.0
+        scale_y = h_out / native_h if native_h > h_out else 1.0
+    else:
+        scale_x = scale_y = 1.0
+
+    margin = max(h_out, w_out) * DRAW_MARGIN_FACTOR
 
     for i, j in lines:
-        p1 = (int(round(pts_2d[i, 0])), int(round(pts_2d[i, 1])))
-        p2 = (int(round(pts_2d[j, 0])), int(round(pts_2d[j, 1])))
+        px1 = int(round(pts_2d[i, 0] * scale_x))
+        py1 = int(round(pts_2d[i, 1] * scale_y))
+        px2 = int(round(pts_2d[j, 0] * scale_x))
+        py2 = int(round(pts_2d[j, 1] * scale_y))
 
-        margin = max(h, w) * DRAW_MARGIN_FACTOR
-        if (-margin <= p1[0] <= w + margin and -margin <= p1[1] <= h + margin and
-                -margin <= p2[0] <= w + margin and -margin <= p2[1] <= h + margin):
-            cv2.line(img_rgb, p1, p2, draw_color, thickness)
+        p1 = (px1, py1)
+        p2 = (px2, py2)
+
+        if (-margin <= p1[0] <= w_out + margin and -margin <= p1[1] <= h_out + margin and
+                -margin <= p2[0] <= w_out + margin and -margin <= p2[1] <= h_out + margin):
+            cv2.line(img_rgb, p1, p2, color, thickness)
 
     return img_rgb
 
@@ -175,16 +204,7 @@ def imwrite_resized(path, img):
 # ============================================================
 
 def reinhard_tonemap(x, white_point=1.0, black_lift=0.0):
-    """Tone mapping Reinhard étendu avec compression des blancs.
-
-    Args:
-        x: image float [0, 1]
-        white_point: valeur au-dessus de laquelle on compresse
-        black_lift: relève les noirs (0 = pas de relevé)
-
-    Returns:
-        image tone-mappée, float [0, 1]
-    """
+    """Tone mapping Reinhard étendu avec compression des blancs."""
     x = np.clip(x, 0.0, 1.0)
     wp2 = white_point * white_point
     x_tm = x * (1.0 + x / wp2) / (1.0 + x)
@@ -195,40 +215,23 @@ def reinhard_tonemap(x, white_point=1.0, black_lift=0.0):
 
 # ============================================================
 #  PIPELINE FLUOROSCOPIE REALISTE
-#  Basé sur la chaîne physique d'un vrai flat-panel C-arm :
-#  DRR (atténuation) → normalisation douce → relevé noirs →
-#  gamma doux → scatter basse-freq → flou détecteur →
-#  bruit quantique (Poisson haute dose) → bruit électronique →
-#  vignettage subtil → inversion → relevé noirs post-inv →
-#  compression blancs → CLAHE très doux
 # ============================================================
 
 def fluoro_realistic(
     img,
-    # --- Normalisation percentile ---
     p_low          = 0.5,
     p_high         = 99.5,
-    # --- Relevé des noirs PRE-inversion (rôle mineur) ---
     black_lift     = 0.02,
-    # --- Exposition ---
     photons        = 8000.0,
-    # --- Gamma (chaîne DICOM typique) ---
     gamma          = 0.50,
-    # --- Scatter (diffusion Compton basse fréquence) ---
     scatter_sigma  = 30.0,
     scatter_weight = 0.08,
-    # --- Flou détecteur (MTF flat-panel ~0.3-0.6 mm FWHM) ---
     blur_sigma     = 0.6,
-    # --- Bruit électronique (readout noise) ---
     elec_sigma     = 0.003,
-    # --- Vignettage ---
     vignette       = 0.10,
-    # --- CLAHE très doux ---
     clahe_clip     = 1.5,
     clahe_grid     = (16, 16),
-    # --- Inversion ---
     invert         = True,
-    # --- Relevé des noirs POST-inversion ---
     post_black_lift     = 0.15,
     post_white_compress = 0.92,
     seed           = 42,
@@ -236,7 +239,6 @@ def fluoro_realistic(
     rng = np.random.default_rng(seed)
     x = img.astype(np.float64)
 
-    # 1. Normalisation percentile robuste
     p_lo_val, p_hi_val = np.percentile(x, [p_low, p_high])
     dyn_range = p_hi_val - p_lo_val
     if dyn_range < 1e-6:
@@ -244,30 +246,22 @@ def fluoro_realistic(
     else:
         x = np.clip((x - p_lo_val) / dyn_range, 0.0, 1.0)
 
-    # 2. Relevé des noirs PRE-inversion
     if black_lift > 0.0:
         x = x * (1.0 - black_lift) + black_lift
 
-    # 3. Gamma
     x = np.power(np.clip(x, 1e-8, 1.0), gamma)
 
-    # 4. Scatter basse fréquence (Compton diffus)
     scatter = gaussian_filter(x.astype(np.float32), sigma=scatter_sigma)
     x = (1.0 - scatter_weight) * x + scatter_weight * scatter.astype(np.float64)
 
-    # 5. Flou détecteur (MTF flat-panel)
     x = cv2.GaussianBlur(x.astype(np.float32), (0, 0), blur_sigma).astype(np.float64)
 
-    # 6. Bruit quantique Poisson
     lam = np.clip(x * photons, 0, None)
     x = rng.poisson(lam).astype(np.float64) / photons
 
-    # 7. Bruit électronique
     x += rng.normal(0.0, elec_sigma, x.shape)
-
     x = np.clip(x, 0.0, 1.0)
 
-    # 8. Vignettage
     h, w = x.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     xn = (xx - w / 2.0) / (w / 2.0)
@@ -275,19 +269,15 @@ def fluoro_realistic(
     r2 = xn * xn + yn * yn
     vig = 1.0 - vignette * r2
     x *= np.clip(vig, 1.0 - vignette, 1.0)
-
     x = np.clip(x, 0.0, 1.0)
 
-    # 9. Inversion
     if invert:
         x = 1.0 - x
 
-    # Post-inversion : relevé des noirs + compression des blancs
     x = x * (1.0 - post_black_lift) + post_black_lift
     x = reinhard_tonemap(x, white_point=post_white_compress, black_lift=0.0)
     x = np.clip(x, 0.0, 1.0)
 
-    # 10. CLAHE très doux
     u8 = (x * 255).astype(np.uint8)
     clahe_obj = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_grid)
     u8 = clahe_obj.apply(u8)
@@ -295,7 +285,6 @@ def fluoro_realistic(
     return u8
 
 
-# --- Preset haute dose (chirurgie, bonne visibilité métal) ---
 def fluoro_high_dose(img, seed=42):
     return fluoro_realistic(
         img,
@@ -304,12 +293,11 @@ def fluoro_high_dose(img, seed=42):
         scatter_sigma=35.0, scatter_weight=0.07,
         blur_sigma=0.5, elec_sigma=0.002, vignette=0.08,
         clahe_clip=1.3, clahe_grid=(16, 16),
-        post_black_lift=0.18, post_white_compress=0.90,
+        post_black_lift=0.28, post_white_compress=0.85,
         seed=seed,
     )
 
 
-# --- Preset dose standard (intervention orthopédique typique) ---
 def fluoro_standard(img, seed=42):
     return fluoro_realistic(
         img,
@@ -318,12 +306,11 @@ def fluoro_standard(img, seed=42):
         scatter_sigma=28.0, scatter_weight=0.09,
         blur_sigma=0.7, elec_sigma=0.004, vignette=0.12,
         clahe_clip=1.6, clahe_grid=(16, 16),
-        post_black_lift=0.15, post_white_compress=0.92,
+        post_black_lift=0.25, post_white_compress=0.88,
         seed=seed,
     )
 
 
-# --- Preset faible dose (pédiatrique / réduction exposition) ---
 def fluoro_low_dose(img, seed=42):
     return fluoro_realistic(
         img,
@@ -332,7 +319,7 @@ def fluoro_low_dose(img, seed=42):
         scatter_sigma=22.0, scatter_weight=0.11,
         blur_sigma=0.9, elec_sigma=0.008, vignette=0.15,
         clahe_clip=1.8, clahe_grid=(12, 12),
-        post_black_lift=0.12, post_white_compress=0.93,
+        post_black_lift=0.20, post_white_compress=0.90,
         seed=seed,
     )
 
@@ -351,9 +338,15 @@ def to_uint8_shared(a, b):
 
 
 def render_pair(ct, mesh, device, tag, bbox_pts_world=None, bbox_lines=None):
-    with Projector([ct], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p0:
+    with Projector([ct], device=device,
+                   spectrum=SPECTRUM,
+                   intensity_upper_bound=IUB,
+                   mode="linear", step=0.1) as p0:
         img0 = p0()
-    with Projector([ct, mesh], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p1:
+    with Projector([ct, mesh], device=device,
+                   spectrum=SPECTRUM,
+                   intensity_upper_bound=IUB,
+                   mode="linear", step=0.1) as p1:
         img1 = p1()
 
     diff = np.abs(img1.astype(np.float32) - img0.astype(np.float32))
@@ -389,20 +382,38 @@ def render_pair(ct, mesh, device, tag, bbox_pts_world=None, bbox_lines=None):
     imwrite_resized(f"fluoro_ld_diff_{tag}.png",
                     to_uint8(np.abs(f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32))))
 
+    # ---- BBox overlay ----
     if bbox_pts_world is not None:
         pts_2d, bbox_lines_valid = project_bbox_on_image(
             bbox_pts_world, bbox_lines, device, img0.shape
         )
 
+        # Redimensionner d'abord à OUTPUT_SIZE, puis dessiner la bbox à l'échelle
+        st_mesh_640  = resize_to_output(f_st_mesh)
+        st_ct_640    = resize_to_output(f_st_ct)
+        hd_mesh_640  = resize_to_output(f_hd_mesh)
+        mix_u8_640   = resize_to_output(mix_u8)
+
+        # draw_bbox_on_image reçoit l'image déjà à 640x640 et scale les pts_2d
+        bbox_std_mesh = draw_bbox_on_image(st_mesh_640,  pts_2d, bbox_lines_valid,
+                                           color=BBOX_COLOR, thickness=BBOX_THICKNESS)
+        bbox_std_ct   = draw_bbox_on_image(st_ct_640,    pts_2d, bbox_lines_valid,
+                                           color=BBOX_COLOR, thickness=BBOX_THICKNESS)
+        bbox_hd_mesh  = draw_bbox_on_image(hd_mesh_640,  pts_2d, bbox_lines_valid,
+                                           color=BBOX_COLOR, thickness=BBOX_THICKNESS)
+        bbox_drr_mesh = draw_bbox_on_image(mix_u8_640,   pts_2d, bbox_lines_valid,
+                                           color=BBOX_COLOR, thickness=BBOX_THICKNESS)
+
+        # Sauvegarder en RGB (imageio attend RGB, cv2 produit BGR)
         iio.imwrite(f"fluoro_std_mesh_bbox_{tag}.png",
-                    draw_bbox_on_image(f_st_mesh, pts_2d, bbox_lines_valid))
+                    cv2.cvtColor(bbox_std_mesh, cv2.COLOR_BGR2RGB))
         iio.imwrite(f"fluoro_std_ct_bbox_{tag}.png",
-                    draw_bbox_on_image(f_st_ct, pts_2d, bbox_lines_valid))
+                    cv2.cvtColor(bbox_std_ct,   cv2.COLOR_BGR2RGB))
         iio.imwrite(f"fluoro_hd_mesh_bbox_{tag}.png",
-                    draw_bbox_on_image(f_hd_mesh, pts_2d, bbox_lines_valid))
+                    cv2.cvtColor(bbox_hd_mesh,  cv2.COLOR_BGR2RGB))
         iio.imwrite(f"drr_mesh_bbox_{tag}.png",
-                    draw_bbox_on_image(mix_u8, pts_2d, bbox_lines_valid))
-        print(f"[{tag}] BBox overlay saved")
+                    cv2.cvtColor(bbox_drr_mesh, cv2.COLOR_BGR2RGB))
+        print(f"[{tag}] BBox overlay saved ({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px)")
 
     print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld  "
           f"({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px)")
@@ -450,10 +461,7 @@ def main():
 
     mesh = Mesh.from_stl(
         stl_path,
-        # density=7.7 g/cm³ : valeur effective pour implant titane/acier chirurgical
-        # (titane pur ~4.5, alliage Ti-6Al-4V ~4.43, acier inox ~8.0)
-        # ajuster selon le matériau réel de l'implant
-        material=DRRMaterial("titanium", density=7.7),
+        material=DRRMaterial("titanium", density=14.0),
     )
 
     device = make_device(
