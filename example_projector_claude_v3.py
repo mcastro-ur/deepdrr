@@ -19,6 +19,7 @@ os.environ["EGL_PLATFORM"] = "surfaceless"
 CT_PATH   = "/scratch/mcastro/deepdrr/ct_full.nii.gz"
 PLY_PATH  = "/scratch/mcastro/deepdrr/data/6.5mmD_32mmThread_L130mm_1.ply"
 FINAL_STL = "/scratch/mcastro/deepdrr/data/mesh_final_strategy_c.stl"
+VTK_BBOX_PATH = "/scratch/mcastro/deepdrr/data/outline.vtk"
 
 # ============================================================
 # PARAMETRES C-ARM
@@ -35,6 +36,7 @@ OUTPUT_SIZE = (640, 640)  # (largeur, hauteur) en pixels
 # ---- Bounding box : couleur et épaisseur ----
 BBOX_COLOR     = (0, 255, 0)   # vert vif (BGR)
 BBOX_THICKNESS = 1             # épaisseur des arêtes en pixels
+DRAW_MARGIN_FACTOR = 2         # tolérance hors image pour ne pas tracer des segments aberrants
 
 
 def _get_matrix(transform):
@@ -57,106 +59,101 @@ def build_registered_mesh_stl(ct):
     tm.export(FINAL_STL)
     mesh_centroid = tm.vertices.mean(axis=0)
     print(f"Mesh centroid (world): {mesh_centroid}")
-    # Calcul de la bounding box 3D (8 coins) dans le repère world
-    vmin = tm.vertices.min(axis=0)
-    vmax = tm.vertices.max(axis=0)
-    bbox_corners_world = np.array([
-        [vmin[0], vmin[1], vmin[2]],
-        [vmax[0], vmin[1], vmin[2]],
-        [vmax[0], vmax[1], vmin[2]],
-        [vmin[0], vmax[1], vmin[2]],
-        [vmin[0], vmin[1], vmax[2]],
-        [vmax[0], vmin[1], vmax[2]],
-        [vmax[0], vmax[1], vmax[2]],
-        [vmin[0], vmax[1], vmax[2]],
-    ])
-    print(f"Bounding box (world) — min: {vmin}  max: {vmax}")
-    return FINAL_STL, mesh_centroid, bbox_corners_world
+    return FINAL_STL, mesh_centroid
 
 
-# ============================================================
-#  PROJECTION 3D → 2D  (world mm → pixels détecteur)
-#
-#  On construit manuellement la matrice P = K @ E[:3, :] à partir
-#  des attributs réellement disponibles sur MobileCArm :
-#    - device.camera_intrinsics  → CameraIntrinsicTransform (fx, fy, cx, cy)
-#    - device.camera3d_from_world → FrameTransform  (extrinsèque 4×4)
-#  Aucun appel à des attributs inexistants (matrix, detector_center…).
-# ============================================================
-
-def _intrinsic_matrix(device) -> np.ndarray:
-    """Retourne la matrice intrinsèque K (3×3) du détecteur."""
-    intr = device.camera_intrinsics   # geo.CameraIntrinsicTransform
-    fx = float(intr.fx)
-    fy = float(intr.fy)
-    cx = float(intr.cx)
-    cy = float(intr.cy)
-    return np.array([
-        [fx,  0., cx],
-        [0.,  fy, cy],
-        [0.,  0., 1.],
-    ], dtype=np.float64)
-
-
-def _extrinsic_matrix(device) -> np.ndarray:
-    """Retourne la matrice extrinsèque E (3×4) camera3d_from_world."""
-    E4 = np.array(device.camera3d_from_world, dtype=np.float64)  # (4,4) ou (3,4)
-    return E4[:3, :]   # on garde les 3 premières lignes → (3, 4)
-
-
-def project_points_world_to_pixel(points_world, device):
+def load_vtk_bbox_points(vtk_path, ct):
     """
-    Projette des points 3D (repère world, mm) → (col, row) pixels.
-
-    Utilise la projection pinhole standard :
-        P = K @ E          (3×4)
-        [u, v, w]^T = P @ [X, Y, Z, 1]^T
-        col = u/w,  row = v/w
+    Charge les points 3D de la bounding box depuis un fichier VTK ASCII
+    et les transforme dans le repère world DeepDRR (même stratégie C que le mesh).
 
     Returns:
-        list of (col, row) int tuples, or None si le point est derrière la caméra.
+        pts_world: np.ndarray (N, 3) en coordonnées world DeepDRR
+        lines: list of (i, j) paires d'indices pour les segments à dessiner
     """
-    K = _intrinsic_matrix(device)   # (3, 3)
-    E = _extrinsic_matrix(device)   # (3, 4)
-    P = K @ E                       # (3, 4)
+    pts = []
+    lines = []
 
-    pixel_pts = []
-    for pt in points_world:
-        ph  = np.append(np.asarray(pt, dtype=np.float64), 1.0)  # (4,)
-        uvw = P @ ph                                              # (3,)
-        w   = uvw[2]
-        if abs(w) < 1e-9 or w < 0:   # derrière la caméra
-            pixel_pts.append(None)
-            continue
-        pixel_pts.append((int(round(uvw[0] / w)),
-                          int(round(uvw[1] / w))))
-    return pixel_pts
+    with open(vtk_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    import re
+    points_match = re.search(r'POINTS\s+(\d+)\s+\w+\s*([\s\S]*?)(?=\n\s*\n|\nMETADATA|\nLINES)', content)
+    if points_match:
+        n_pts = int(points_match.group(1))
+        pts_text = points_match.group(2).strip()
+        nums = [float(x) for x in pts_text.split()]
+        if len(nums) < n_pts * 3:
+            raise ValueError(f"VTK incomplet: {len(nums)} coordonnées pour {n_pts} points")
+        for i in range(0, n_pts * 3, 3):
+            pts.append([nums[i], nums[i + 1], nums[i + 2]])
+
+    pts = np.array(pts, dtype=np.float64)
+
+    conn_match = re.search(r'CONNECTIVITY\s+\w+\s*([\s\S]*?)(?=\nCELL_DATA|\nPOINT_DATA|\Z)', content)
+    if conn_match:
+        conn_nums = [int(x) for x in conn_match.group(1).strip().split()]
+        for i in range(0, len(conn_nums) - 1, 2):
+            lines.append((conn_nums[i], conn_nums[i + 1]))
+
+    W = _get_matrix(ct.world_from_anatomical)
+    flip_lps_ras = np.diag([-1., -1., 1., 1.])
+    pts_world = _apply_transform(W @ flip_lps_ras, pts)
+
+    print(f"BBox VTK: {len(pts_world)} points, {len(lines)} segments chargés")
+    print(f"BBox world bounds: {pts_world.min(axis=0)} → {pts_world.max(axis=0)}")
+
+    return pts_world, lines
 
 
-# Arêtes du cube (indices des 8 coins)
-BBOX_EDGES = [
-    (0, 1), (1, 2), (2, 3), (3, 0),   # face basse
-    (4, 5), (5, 6), (6, 7), (7, 4),   # face haute
-    (0, 4), (1, 5), (2, 6), (3, 7),   # colonnes verticales
-]
-
-
-def draw_bbox_on_image(img_u8, bbox_corners_world, device,
-                       color=BBOX_COLOR, thickness=BBOX_THICKNESS):
+def project_bbox_on_image(pts_world, lines, device, img_shape):
     """
-    Convertit img_u8 (uint8 grayscale) en BGR, projette les 8 coins 3D
-    de la bounding box et trace les 12 arêtes. Retourne une image BGR uint8.
+    Projette les points 3D world sur l'image 2D via la CameraProjection du C-arm.
+
+    Returns:
+        pts_2d: np.ndarray (N, 2) coordonnées pixel (col, row) — peut être hors image
+        lines: liste de paires d'indices valides à dessiner
     """
-    bgr = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
-    pts2d = project_points_world_to_pixel(bbox_corners_world, device)
+    proj = device.get_camera_projection()
 
-    for i, j in BBOX_EDGES:
-        pi, pj = pts2d[i], pts2d[j]
-        if pi is None or pj is None:
-            continue
-        cv2.line(bgr, pi, pj, color, thickness, lineType=cv2.LINE_AA)
+    pts_2d = []
+    for pt in pts_world:
+        p2d = proj @ geo.point(*pt)
+        pts_2d.append([float(p2d[0]), float(p2d[1])])
 
-    return bgr
+    pts_2d = np.array(pts_2d, dtype=np.float64)
+    return pts_2d, lines
+
+
+def draw_bbox_on_image(img_u8, pts_2d, lines, color=(0, 0, 255), thickness=1):
+    """
+    Dessine la bounding box (segments) sur une image uint8 en niveaux de gris.
+
+    Args:
+        img_u8: np.ndarray (H, W) uint8
+        pts_2d: np.ndarray (N, 2) coordonnées pixel (col, row)
+        lines: list of (i, j) paires d'indices
+        color: couleur BGR des segments
+        thickness: épaisseur des segments en pixels
+
+    Returns:
+        img_rgb: np.ndarray (H, W, 3) uint8 avec bbox dessinée en rouge sur fond gris
+    """
+    img_rgb = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
+    draw_color = color
+
+    h, w = img_u8.shape
+
+    for i, j in lines:
+        p1 = (int(round(pts_2d[i, 0])), int(round(pts_2d[i, 1])))
+        p2 = (int(round(pts_2d[j, 0])), int(round(pts_2d[j, 1])))
+
+        margin = max(h, w) * DRAW_MARGIN_FACTOR
+        if (-margin <= p1[0] <= w + margin and -margin <= p1[1] <= h + margin and
+                -margin <= p2[0] <= w + margin and -margin <= p2[1] <= h + margin):
+            cv2.line(img_rgb, p1, p2, draw_color, thickness)
+
+    return img_rgb
 
 
 def resize_to_output(img):
@@ -353,7 +350,7 @@ def to_uint8_shared(a, b):
     return _cvt(a), _cvt(b)
 
 
-def render_pair(ct, mesh, device, tag, bbox_corners_world):
+def render_pair(ct, mesh, device, tag, bbox_pts_world=None, bbox_lines=None):
     with Projector([ct], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p0:
         img0 = p0()
     with Projector([ct, mesh], device=device, intensity_upper_bound=12.0, mode="linear", step=0.1) as p1:
@@ -362,45 +359,53 @@ def render_pair(ct, mesh, device, tag, bbox_corners_world):
     diff = np.abs(img1.astype(np.float32) - img0.astype(np.float32))
     print(f"[{tag}] diff max={float(diff.max()):.6f} mean={float(diff.mean()):.6f}")
 
-    def _with_bbox(u8):
-        """Ajoute la bounding box 3D projetée sur une image grayscale uint8."""
-        return draw_bbox_on_image(u8, bbox_corners_world, device)
-
     # ---- DRR bruts ----
     ct_u8, mix_u8 = to_uint8_shared(img0, img1)
-    imwrite_resized(f"drr_ct_{tag}.png",   _with_bbox(ct_u8))
-    imwrite_resized(f"drr_mesh_{tag}.png", _with_bbox(mix_u8))
-    imwrite_resized(f"drr_diff_{tag}.png", _with_bbox(to_uint8(diff)))
+    imwrite_resized(f"drr_ct_{tag}.png", ct_u8)
+    imwrite_resized(f"drr_mesh_{tag}.png", mix_u8)
+    imwrite_resized(f"drr_diff_{tag}.png", to_uint8(diff))
 
     # ---- Haute dose ----
     f_hd_ct   = fluoro_high_dose(img0)
     f_hd_mesh = fluoro_high_dose(img1)
-    imwrite_resized(f"fluoro_hd_ct_{tag}.png",   _with_bbox(f_hd_ct))
-    imwrite_resized(f"fluoro_hd_mesh_{tag}.png",  _with_bbox(f_hd_mesh))
+    imwrite_resized(f"fluoro_hd_ct_{tag}.png", f_hd_ct)
+    imwrite_resized(f"fluoro_hd_mesh_{tag}.png", f_hd_mesh)
     imwrite_resized(f"fluoro_hd_diff_{tag}.png",
-                    _with_bbox(to_uint8(np.abs(
-                        f_hd_mesh.astype(np.float32) - f_hd_ct.astype(np.float32)))))
+                    to_uint8(np.abs(f_hd_mesh.astype(np.float32) - f_hd_ct.astype(np.float32))))
 
     # ---- Dose standard ----
     f_st_ct   = fluoro_standard(img0)
     f_st_mesh = fluoro_standard(img1)
-    imwrite_resized(f"fluoro_std_ct_{tag}.png",   _with_bbox(f_st_ct))
-    imwrite_resized(f"fluoro_std_mesh_{tag}.png",  _with_bbox(f_st_mesh))
+    imwrite_resized(f"fluoro_std_ct_{tag}.png", f_st_ct)
+    imwrite_resized(f"fluoro_std_mesh_{tag}.png", f_st_mesh)
     imwrite_resized(f"fluoro_std_diff_{tag}.png",
-                    _with_bbox(to_uint8(np.abs(
-                        f_st_mesh.astype(np.float32) - f_st_ct.astype(np.float32)))))
+                    to_uint8(np.abs(f_st_mesh.astype(np.float32) - f_st_ct.astype(np.float32))))
 
     # ---- Faible dose ----
     f_ld_ct   = fluoro_low_dose(img0)
     f_ld_mesh = fluoro_low_dose(img1)
-    imwrite_resized(f"fluoro_ld_ct_{tag}.png",   _with_bbox(f_ld_ct))
-    imwrite_resized(f"fluoro_ld_mesh_{tag}.png",  _with_bbox(f_ld_mesh))
+    imwrite_resized(f"fluoro_ld_ct_{tag}.png", f_ld_ct)
+    imwrite_resized(f"fluoro_ld_mesh_{tag}.png", f_ld_mesh)
     imwrite_resized(f"fluoro_ld_diff_{tag}.png",
-                    _with_bbox(to_uint8(np.abs(
-                        f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32)))))
+                    to_uint8(np.abs(f_ld_mesh.astype(np.float32) - f_ld_ct.astype(np.float32))))
+
+    if bbox_pts_world is not None:
+        pts_2d, bbox_lines_valid = project_bbox_on_image(
+            bbox_pts_world, bbox_lines, device, img0.shape
+        )
+
+        iio.imwrite(f"fluoro_std_mesh_bbox_{tag}.png",
+                    draw_bbox_on_image(f_st_mesh, pts_2d, bbox_lines_valid))
+        iio.imwrite(f"fluoro_std_ct_bbox_{tag}.png",
+                    draw_bbox_on_image(f_st_ct, pts_2d, bbox_lines_valid))
+        iio.imwrite(f"fluoro_hd_mesh_bbox_{tag}.png",
+                    draw_bbox_on_image(f_hd_mesh, pts_2d, bbox_lines_valid))
+        iio.imwrite(f"drr_mesh_bbox_{tag}.png",
+                    draw_bbox_on_image(mix_u8, pts_2d, bbox_lines_valid))
+        print(f"[{tag}] BBox overlay saved")
 
     print(f"[{tag}] Saved: drr + fluoro_hd + fluoro_std + fluoro_ld  "
-          f"({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px, bbox projetée en vert)")
+          f"({OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} px)")
 
 
 def make_device(mesh_centroid_world, alpha_deg, beta_deg, sdd, sid):
@@ -441,7 +446,7 @@ def main():
     ct = deepdrr.Volume.from_nifti(CT_PATH)
     print("CT center (world):", np.array(ct.center_in_world))
 
-    stl_path, mesh_centroid, bbox_corners_world = build_registered_mesh_stl(ct)
+    stl_path, mesh_centroid = build_registered_mesh_stl(ct)
 
     mesh = Mesh.from_stl(
         stl_path,
@@ -459,7 +464,21 @@ def main():
         sid=SID,
     )
 
-    render_pair(ct, mesh, device, "final", bbox_corners_world)
+    bbox_pts_world, bbox_lines = None, None
+    if os.path.exists(VTK_BBOX_PATH):
+        try:
+            bbox_pts_world, bbox_lines = load_vtk_bbox_points(VTK_BBOX_PATH, ct)
+        except Exception as e:
+            print(f"[WARN] BBox VTK non chargé: {e}")
+
+    render_pair(
+        ct,
+        mesh,
+        device,
+        "final",
+        bbox_pts_world=bbox_pts_world,
+        bbox_lines=bbox_lines,
+    )
 
     print("\nDone. Outputs par preset :")
     print("  drr_ct / drr_mesh / drr_diff")
@@ -467,7 +486,7 @@ def main():
     print("  fluoro_std_ct / fluoro_std_mesh / fluoro_std_diff ← dose standard")
     print("  fluoro_ld_ct / fluoro_ld_mesh / fluoro_ld_diff   ← faible dose, plus granulaire")
     print(f"  Toutes les images : {OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]} pixels")
-    print("  Bounding box 3D du PLY projetée en vert sur toutes les images")
+    print("  + overlay bbox VTK: drr_mesh_bbox / fluoro_std_ct_bbox / fluoro_std_mesh_bbox / fluoro_hd_mesh_bbox")
 
 
 if __name__ == "__main__":
